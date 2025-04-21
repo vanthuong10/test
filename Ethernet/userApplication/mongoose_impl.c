@@ -14,7 +14,7 @@
 #endif
 
 #ifndef offsetof
-#define offsetof(st, m) ((size_t) ( (char *)&((st *)0)->m - (char *)0 ))
+#define offsetof(st, m) ((size_t) ((char *) &((st *) 0)->m - (char *) 0))
 #endif
 
 #define NO_CACHE_HEADERS "Cache-Control: no-cache\r\n"
@@ -40,11 +40,17 @@
   "4hf5Gx17YJkq5/z3k6ogPDPpoAYWIw1/sw==\n"                             \
   "-----END EC PRIVATE KEY-----\n"
 
+typedef void (*mongoose_data_func_t)(void *);
+typedef bool (*mongoose_action_checker_t)(void);
+typedef void (*mongoose_action_starter_t)(struct mg_str);
+typedef void *(*mongoose_ota_opener_t)(char *, size_t);
+typedef bool (*mongoose_ota_closer_t)(void *);
+typedef bool (*mongoose_ota_writer_t)(void *, void *, size_t);
+typedef void (*mongoose_custom_reply_t)(struct mg_connection *, struct mg_http_message *);
+
 struct mg_mgr g_mgr;  // Mongoose event manager
 
 #if WIZARD_ENABLE_HTTP || WIZARD_ENABLE_HTTPS
-
-#if WIZARD_ENABLE_HTTP_UI
 // Every time device state changes, this counter increments.
 // Used by the heartbeat endpoint, to signal the UI when to refresh
 static unsigned long s_device_change_version = 0;
@@ -64,17 +70,49 @@ struct apihandler {
   bool readonly;
   int read_level;
   int write_level;
-  unsigned long version;                   // Every change increments version
-  const struct attribute *attributes;      // Points to the strucure descriptor
-  void (*getter)(void *);                  // Getter/check/begin function
-  void (*setter)(void *);                  // Setter/start/end function
+  unsigned long version;
+};
+
+struct apihandler_custom {
+  struct apihandler common;
+  void (*reply)(struct mg_connection *, struct mg_http_message *);
+};
+
+struct apihandler_upload {
+  struct apihandler common;
   void *(*opener)(char *, size_t);         // Open function (OTA and upload)
   bool (*closer)(void *);                  // Closer function (OTA and upload)
   bool (*writer)(void *, void *, size_t);  // Writer function (OTA and upload)
-  bool (*checker)(void);                   // Checker function for actions
-  void (*starter)(void);                   // Starter function for actions
-  size_t (*grapher)(uint32_t, uint32_t, uint32_t *, double *, size_t);
-  size_t data_size;  // Size of C structure
+};
+
+struct apihandler_ota {
+  struct apihandler common;
+  void *(*opener)(char *, size_t);         // Open function (OTA and upload)
+  bool (*closer)(void *);                  // Closer function (OTA and upload)
+  bool (*writer)(void *, void *, size_t);  // Writer function (OTA and upload)
+};
+
+struct apihandler_action {
+  struct apihandler common;
+  bool (*checker)(void);           // Checker function for actions
+  void (*starter)(struct mg_str);  // Starter function for actions
+};
+
+struct apihandler_data {
+  struct apihandler common;
+  const struct attribute *attributes;  // Points to the strucure descriptor
+  size_t data_size;                    // Size of C structure
+  void (*getter)(void *);              // Getter/check/begin function
+  void (*setter)(void *);              // Setter/start/end function
+};
+
+struct apihandler_array {
+  struct apihandler common;
+  const struct attribute *attributes;  // Points to the strucure descriptor
+  size_t data_size;                    // Size of C structure
+  void (*getter)(uint64_t, void *);    // Getter/check/begin function
+  void (*setter)(uint64_t, void *);    // Setter/start/end function
+  uint64_t (*sizer)(void);             // Array size, for data handlers only
 };
 
 struct attribute s_state_attributes[] = {
@@ -94,9 +132,17 @@ struct attribute s_leds_attributes[] = {
   {"led3", "bool", NULL, offsetof(struct leds, led3), 0, false},
   {NULL, NULL, NULL, 0, 0, false}
 };
+struct attribute s_network_settings_attributes[] = {
+  {"shuttle_id", "int", NULL, offsetof(struct network_settings, shuttle_id), 0, false},
+  {"ip_address", "string", NULL, offsetof(struct network_settings, ip_address), 20, false},
+  {"gw_address", "string", NULL, offsetof(struct network_settings, gw_address), 20, false},
+  {"netmask", "string", NULL, offsetof(struct network_settings, netmask), 20, false},
+  {"dhcp", "bool", NULL, offsetof(struct network_settings, dhcp), 0, false},
+  {NULL, NULL, NULL, 0, 0, false}
+};
 struct attribute s_settings_attributes[] = {
   {"string_val", "string", NULL, offsetof(struct settings, string_val), 40, false},
-  {"log_level", "int", NULL, offsetof(struct settings, log_level), 0, false},
+  {"log_level", "string", NULL, offsetof(struct settings, log_level), 10, false},
   {"double_val", "double", "%.5f", offsetof(struct settings, double_val), 0, false},
   {"int_val", "int", NULL, offsetof(struct settings, int_val), 0, false},
   {"bool_val", "bool", NULL, offsetof(struct settings, bool_val), 0, false},
@@ -107,32 +153,54 @@ struct attribute s_security_attributes[] = {
   {"user_password", "string", NULL, offsetof(struct security, user_password), 40, false},
   {NULL, NULL, NULL, 0, 0, false}
 };
-static struct apihandler s_apihandlers[] = {
-  {"reboot", "action", false, 3, 7, 0UL, NULL, NULL, NULL, NULL, NULL, NULL, glue_check_reboot, glue_start_reboot, NULL, 0},
-  {"firmware_update", "ota", false, 3, 7, 0UL, NULL, NULL, NULL, glue_ota_begin_firmware_update, glue_ota_end_firmware_update, glue_ota_write_firmware_update, NULL, NULL, NULL, 0},
-  {"file_upload", "upload", false, 3, 7, 0UL, NULL, NULL, NULL, glue_file_open_file_upload, glue_file_close_file_upload, glue_file_write_file_upload, NULL, NULL, NULL, 0},
-  {"graph1", "graph", false, 3, 3, 0UL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, glue_graph_get_graph1, 0},
-  {"state", "object", true, 0, 0, 0UL, s_state_attributes, (void (*)(void *)) glue_get_state, (void (*)(void *)) glue_set_state, NULL, NULL, NULL, NULL, NULL, NULL, sizeof(struct state)},
-  {"leds", "object", false, 3, 3, 0UL, s_leds_attributes, (void (*)(void *)) glue_get_leds, (void (*)(void *)) glue_set_leds, NULL, NULL, NULL, NULL, NULL, NULL, sizeof(struct leds)},
-  {"settings", "object", false, 3, 7, 0UL, s_settings_attributes, (void (*)(void *)) glue_get_settings, (void (*)(void *)) glue_set_settings, NULL, NULL, NULL, NULL, NULL, NULL, sizeof(struct settings)},
-  {"security", "object", false, 7, 7, 0UL, s_security_attributes, (void (*)(void *)) glue_get_security, (void (*)(void *)) glue_set_security, NULL, NULL, NULL, NULL, NULL, NULL, sizeof(struct security)},
-  {"events", "array", false, 0, 0, 0UL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0}
+
+struct apihandler_action s_apihandler_reboot = {{"reboot", "action", false, 3, 7, 0UL}, glue_check_reboot, glue_start_reboot};
+struct apihandler_action s_apihandler_reformat = {{"reformat", "action", false, 3, 7, 0UL}, glue_check_reformat, glue_start_reformat};
+struct apihandler_ota s_apihandler_firmware_update = {{"firmware_update", "ota", false, 3, 7, 0UL}, glue_ota_begin_firmware_update, glue_ota_end_firmware_update, glue_ota_write_firmware_update};
+struct apihandler_upload s_apihandler_file_upload = {{"file_upload", "upload", false, 3, 7, 0UL}, glue_file_open_file_upload, glue_file_close_file_upload, glue_file_write_file_upload};
+struct apihandler_custom s_apihandler_graph_data = {{"graph_data", "custom", false, 3, 3, 0UL}, glue_reply_graph_data};
+struct apihandler_data s_apihandler_state = {{"state", "data", true, 0, 0, 0UL}, s_state_attributes, sizeof(struct state), (void (*)(void *)) glue_get_state, NULL};
+struct apihandler_data s_apihandler_leds = {{"leds", "data", false, 3, 3, 0UL}, s_leds_attributes, sizeof(struct leds), (void (*)(void *)) glue_get_leds, (void (*)(void *)) glue_set_leds};
+struct apihandler_data s_apihandler_network_settings = {{"network_settings", "data", false, 3, 7, 0UL}, s_network_settings_attributes, sizeof(struct network_settings), (void (*)(void *)) glue_get_network_settings, (void (*)(void *)) glue_set_network_settings};
+struct apihandler_data s_apihandler_settings = {{"settings", "data", false, 3, 7, 0UL}, s_settings_attributes, sizeof(struct settings), (void (*)(void *)) glue_get_settings, (void (*)(void *)) glue_set_settings};
+struct apihandler_data s_apihandler_security = {{"security", "data", false, 7, 7, 0UL}, s_security_attributes, sizeof(struct security), (void (*)(void *)) glue_get_security, (void (*)(void *)) glue_set_security};
+struct apihandler_custom s_apihandler_loglevels = {{"loglevels", "custom", false, 0, 0, 0UL}, glue_reply_loglevels};
+struct apihandler_custom s_apihandler_events = {{"events", "custom", false, 0, 0, 0UL}, glue_reply_events};
+
+static struct apihandler *s_apihandlers[] = {
+  (struct apihandler *) &s_apihandler_reboot,
+  (struct apihandler *) &s_apihandler_reformat,
+  (struct apihandler *) &s_apihandler_firmware_update,
+  (struct apihandler *) &s_apihandler_file_upload,
+  (struct apihandler *) &s_apihandler_graph_data,
+  (struct apihandler *) &s_apihandler_state,
+  (struct apihandler *) &s_apihandler_leds,
+  (struct apihandler *) &s_apihandler_network_settings,
+  (struct apihandler *) &s_apihandler_settings,
+  (struct apihandler *) &s_apihandler_security,
+  (struct apihandler *) &s_apihandler_loglevels,
+  (struct apihandler *) &s_apihandler_events
 };
 
-static struct apihandler *find_handler(struct mg_http_message *hm) {
+static struct apihandler *get_api_handler(struct mg_str name) {
+  size_t num_handlers = sizeof(s_apihandlers) / sizeof(s_apihandlers[0]);
   size_t i;
-  if (hm->uri.len < 6 || strncmp(hm->uri.buf, "/api/", 5) != 0) return NULL;
-  for (i = 0; i < sizeof(s_apihandlers) / sizeof(s_apihandlers[0]); i++) {
-    struct apihandler *h = &s_apihandlers[i];
+  if (name.len == 0) return NULL;
+  if (num_handlers == 0) return NULL;
+  for (i = 0; i < num_handlers; i++) {
+    struct apihandler *h = s_apihandlers[i];
     size_t n = strlen(h->name);
-    if (n + 5 > hm->uri.len) continue;
-    if (strncmp(hm->uri.buf + 5, h->name, n) != 0) continue;
-    MG_INFO(("%.*s %s %lu %lu", hm->uri.len, hm->uri.buf, h->name, n + 5,
-             hm->uri.len));
-    if (n + 5 < hm->uri.len && hm->uri.buf[n + 5] != '/') continue;
+    if (n > name.len) continue;
+    if (strncmp(name.buf, h->name, n) != 0) continue;
+    if (name.len > n && name.buf[n] != '/') continue;
     return h;
   }
   return NULL;
+}
+
+static struct apihandler *find_handler(struct mg_http_message *hm) {
+  if (hm->uri.len < 6 || strncmp(hm->uri.buf, "/api/", 5) != 0) return NULL;
+  return get_api_handler(mg_str_n(hm->uri.buf + 5, hm->uri.len - 5));
 }
 
 void mg_json_get_str2(struct mg_str json, const char *path, char *buf,
@@ -141,6 +209,34 @@ void mg_json_get_str2(struct mg_str json, const char *path, char *buf,
   if (s.len > 1 && s.buf[0] == '"') {
     mg_json_unescape(mg_str_n(s.buf + 1, s.len - 2), buf, len);
   }
+}
+
+void mongoose_set_http_handlers(const char *name, ...) {
+  struct apihandler *h = get_api_handler(mg_str(name));
+  va_list ap;
+  va_start(ap, name);
+  if (h == NULL) {
+    MG_ERROR(("No API with name [%s]", name));
+  } else if (strcmp(h->type, "data") == 0) {
+    ((struct apihandler_data *) h)->getter = va_arg(ap, mongoose_data_func_t);
+    ((struct apihandler_data *) h)->setter = va_arg(ap, mongoose_data_func_t);
+  } else if (strcmp(h->type, "action") == 0) {
+    ((struct apihandler_action *) h)->checker = va_arg(ap, mongoose_action_checker_t);
+    ((struct apihandler_action *) h)->starter =
+        va_arg(ap, mongoose_action_starter_t);
+  } else if (strcmp(h->type, "ota") == 0 || strcmp(h->type, "upload") == 0) {
+    ((struct apihandler_ota *) h)->opener =
+        va_arg(ap, mongoose_ota_opener_t);
+    ((struct apihandler_ota *) h)->closer = va_arg(ap, mongoose_ota_closer_t);
+    ((struct apihandler_ota *) h)->writer =
+        va_arg(ap, mongoose_ota_writer_t);
+  } else if (strcmp(h->type, "custom") == 0) {
+    ((struct apihandler_custom *) h)->reply =
+        va_arg(ap, mongoose_custom_reply_t);
+  } else {
+    MG_ERROR(("Setting [%s] failed: not implemented", name));
+  }
+  va_end(ap);
 }
 
 #if WIZARD_ENABLE_HTTP_UI_LOGIN
@@ -192,8 +288,8 @@ static void handle_login(struct mg_connection *c, struct user *u) {
               "Set-Cookie: access_token=%s; Path=/; "
               "%sHttpOnly; SameSite=Lax; Max-Age=%d\r\n",
               u->token, c->is_tls ? "Secure; " : "", 3600 * 24);
-  mg_http_reply(c, 200, cookie, "{%m:%m,%m:%d}",  //
-                MG_ESC("user"), MG_ESC(u->name),  //
+  mg_http_reply(c, 200, cookie, "{%m:%m,%m:%d}\n",  //
+                MG_ESC("user"), MG_ESC(u->name),    //
                 MG_ESC("level"), u->level);
 }
 
@@ -242,11 +338,11 @@ static void upload_handler(struct mg_connection *c, int ev, void *ev_data) {
   // Catch uploaded file data for both MG_EV_READ and MG_EV_HTTP_HDRS
   if (us->marker == 'U' && ev == MG_EV_READ && us->expected > 0 &&
       c->recv.len > 0) {
-    size_t alignment = 32;  // Maximum flash write granularity (STM32H7)
+    size_t alignment = 512;  // Maximum flash write granularity (iMXRT, Pico)
     size_t aligned = (us->received + c->recv.len < us->expected)
                          ? aligned = MG_ROUND_DOWN(c->recv.len, alignment)
                          : c->recv.len;  // Last write can be unaligned
-    bool ok = us->fn_write(us->fp, c->recv.buf, aligned);
+    bool ok = aligned > 0 ? us->fn_write(us->fp, c->recv.buf, aligned) : true;
     us->received += aligned;
     MG_DEBUG(("%lu chunk: %lu/%lu, %lu/%lu, ok: %d", c->id, aligned,
               c->recv.len, us->received, us->expected, ok));
@@ -306,28 +402,19 @@ static void handle_uploads(struct mg_connection *c, int ev, void *ev_data) {
   if (ev == MG_EV_HTTP_HDRS && us->marker == 0) {
     struct mg_http_message *hm = (struct mg_http_message *) ev_data;
     struct apihandler *h = find_handler(hm);
-#if WIZARD_ENABLE_HTTP_UI_LOGIN
-    struct user *u = authenticate(hm);
-    if (mg_match(hm->uri, mg_str("/api/#"), NULL) &&
-        (u == NULL ||
-         (h != NULL && (u->level < h->read_level ||
-                        (hm->body.len > 0 && u->level < h->write_level))))) {
-      // MG_INFO(("DENY: %d, %d %d", u->level, h->read_level, h->write_level));
-      mg_http_reply(c, 403, JSON_HEADERS, "Not Authorised\n");
-    } else
-#endif
-        if (h != NULL &&
-            (strcmp(h->type, "upload") == 0 || strcmp(h->type, "ota") == 0)) {
-      // OTA/upload endpoints
-      prep_upload(c, hm, h->opener, h->closer, h->writer);
+    if (h != NULL &&
+        (strcmp(h->type, "upload") == 0 || strcmp(h->type, "ota") == 0)) {
+      struct apihandler_upload *hu = (struct apihandler_upload *) h;
+      prep_upload(c, hm, hu->opener, hu->closer, hu->writer);
     }
   }
 }
 
 static void handle_action(struct mg_connection *c, struct mg_http_message *hm,
-                          bool (*check_fn)(void), void (*start_fn)(void)) {
+                          bool (*check_fn)(void),
+                          void (*start_fn)(struct mg_str)) {
   if (hm->body.len > 0) {
-    start_fn();
+    start_fn(hm->body);
     if (check_fn()) {
       struct action_state *as = (struct action_state *) c->data;
       as->marker = 'A';
@@ -341,22 +428,21 @@ static void handle_action(struct mg_connection *c, struct mg_http_message *hm,
 }
 
 size_t print_struct(void (*out)(char, void *), void *ptr, va_list *ap) {
-  struct apihandler *h = va_arg(*ap, struct apihandler *);
+  const struct attribute *a = va_arg(*ap, struct attribute *);
   char *data = va_arg(*ap, char *);
   size_t i, len = 0;
-  for (i = 0; h->attributes[i].name != NULL; i++) {
-    char *attrptr = data + h->attributes[i].offset;
-    len += mg_xprintf(out, ptr, "%s%m:", i == 0 ? "" : ",",
-                      MG_ESC(h->attributes[i].name));
-    if (strcmp(h->attributes[i].type, "int") == 0) {
+  for (i = 0; a[i].name != NULL; i++) {
+    char *attrptr = data + a[i].offset;
+    len += mg_xprintf(out, ptr, "%s%m:", i == 0 ? "" : ",", MG_ESC(a[i].name));
+    if (strcmp(a[i].type, "int") == 0) {
       len += mg_xprintf(out, ptr, "%d", *(int *) attrptr);
-    } else if (strcmp(h->attributes[i].type, "double") == 0) {
-      const char *fmt = h->attributes[i].format;
+    } else if (strcmp(a[i].type, "double") == 0) {
+      const char *fmt = a[i].format;
       if (fmt == NULL) fmt = "%g";
       len += mg_xprintf(out, ptr, fmt, *(double *) attrptr);
-    } else if (strcmp(h->attributes[i].type, "bool") == 0) {
+    } else if (strcmp(a[i].type, "bool") == 0) {
       len += mg_xprintf(out, ptr, "%s", *(bool *) attrptr ? "true" : "false");
-    } else if (strcmp(h->attributes[i].type, "string") == 0) {
+    } else if (strcmp(a[i].type, "string") == 0) {
       len += mg_xprintf(out, ptr, "%m", MG_ESC(attrptr));
     } else {
       len += mg_xprintf(out, ptr, "null");
@@ -366,7 +452,7 @@ size_t print_struct(void (*out)(char, void *), void *ptr, va_list *ap) {
 }
 
 static void handle_object(struct mg_connection *c, struct mg_http_message *hm,
-                          struct apihandler *h) {
+                          struct apihandler_data *h) {
   void *data = calloc(1, h->data_size);
   h->getter(data);
   if (hm->body.len > 0 && h->data_size > 0) {
@@ -393,12 +479,40 @@ static void handle_object(struct mg_connection *c, struct mg_http_message *hm,
     }
     // If structure changes, increment version
     if (memcmp(data, tmp, h->data_size) != 0) s_device_change_version++;
-    h->setter(tmp);
+    if (h->setter != NULL) h->setter(tmp);  // Can be NULL if readonly
     free(tmp);
     h->getter(data);  // Re-sync again after setting
   }
-  mg_http_reply(c, 200, JSON_HEADERS, "{%M}\n", print_struct, h, data);
+  mg_http_reply(c, 200, JSON_HEADERS, "{%M}\n", print_struct, h->attributes,
+                data);
   free(data);
+}
+
+static size_t print_array(void (*out)(char, void *), void *ptr, va_list *ap) {
+  struct apihandler_array *ha = va_arg(*ap, struct apihandler_array *);
+  uint64_t size = *va_arg(*ap, uint64_t *);
+  uint64_t start = *va_arg(*ap, uint64_t *);
+  size_t i, max = 20, len = 0;
+  void *data = calloc(1, ha->data_size);
+  for (i = 0; i < max && start + i < size; i++) {
+    ha->getter(start + i, data);
+    if (i > 0) len += mg_xprintf(out, ptr, ",");
+    len += mg_xprintf(out, ptr, "{%M}", print_struct, ha->attributes, data);
+  }
+  free(data);
+  return len;
+}
+
+static void handle_array(struct mg_connection *c, struct mg_http_message *hm,
+                         struct apihandler_array *h) {
+  char buf[40] = "";
+  uint64_t size = h->sizer();
+  uint64_t start = 0;
+  mg_http_get_var(&hm->query, "start", buf, sizeof(buf));
+  if (!mg_str_to_num(mg_str(buf), 10, &start, sizeof(start))) start = 0;
+  mg_http_reply(c, 200, JSON_HEADERS, "{%m:%llu, %m:%llu, %m:[%M]}\n",
+                MG_ESC("size"), size, MG_ESC("start"), start, MG_ESC("data"),
+                print_array, h, &size, &start);
 }
 
 size_t print_timeseries(void (*out)(char, void *), void *ptr, va_list *ap) {
@@ -413,26 +527,19 @@ size_t print_timeseries(void (*out)(char, void *), void *ptr, va_list *ap) {
   return len;
 }
 
-static void handle_graph(struct mg_connection *c, struct mg_http_message *hm,
-                         struct apihandler *h) {
-  long from = mg_json_get_long(hm->body, "$.from", 0);
-  long to = mg_json_get_long(hm->body, "$.to", 0);
-  uint32_t timestamps[20];
-  double values[sizeof(timestamps) / sizeof(timestamps[0])];
-  size_t count = h->grapher(from, to, timestamps, values,
-                            sizeof(timestamps) / sizeof(timestamps[0]));
-  mg_http_reply(c, 200, JSON_HEADERS, "[%M]\n", print_timeseries, timestamps,
-                values, count);
-}
-
 static void handle_api_call(struct mg_connection *c, struct mg_http_message *hm,
                             struct apihandler *h) {
-  if (strcmp(h->type, "object") == 0) {
-    handle_object(c, hm, h);
+  if (strcmp(h->type, "object") == 0 || strcmp(h->type, "data") == 0) {
+    handle_object(c, hm, (struct apihandler_data *) h);
+  } else if (strcmp(h->type, "array") == 0) {
+    handle_array(c, hm, (struct apihandler_array *) h);
   } else if (strcmp(h->type, "action") == 0) {
-    handle_action(c, hm, h->checker, h->starter);
-  } else if (strcmp(h->type, "graph") == 0) {
-    handle_graph(c, hm, h);
+    struct apihandler_action *ha = (struct apihandler_action *) h;
+    handle_action(c, hm, ha->checker, ha->starter);
+    //  } else if (strcmp(h->type, "graph") == 0) {
+    //    handle_graph(c, hm, (struct apihandler_graph *) h);
+  } else if (strcmp(h->type, "custom") == 0) {
+    ((struct apihandler_custom *) h)->reply(c, hm);
   } else {
     mg_http_reply(c, 500, JSON_HEADERS, "API type %s unknown\n", h->type);
   }
@@ -441,34 +548,42 @@ static void handle_api_call(struct mg_connection *c, struct mg_http_message *hm,
 void glue_update_state(void) {
   s_device_change_version++;
 }
-#endif  // WIZARD_ENABLE_HTTP_UI
 
 // Mongoose event handler function, gets called by the mg_mgr_poll()
 static void http_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
-#if WIZARD_ENABLE_HTTP_UI
-  handle_uploads(c, ev, ev_data);
-  if (ev == MG_EV_POLL && c->data[0] == 'A') {
+  if (ev == MG_EV_HTTP_HDRS && c->data[0] == 0) {
+#if WIZARD_ENABLE_HTTP_UI_LOGIN
+    struct mg_http_message *hm = (struct mg_http_message *) ev_data;
+    if (mg_match(hm->uri, mg_str("/api/#"), NULL) ||
+        mg_match(hm->uri, mg_str("/websocket"), NULL)) {
+      struct apihandler *h = find_handler(hm);
+      struct user *u = authenticate(hm);
+      if ((u == NULL ||
+           (h != NULL && (u->level < h->read_level ||
+                          (hm->body.len > 0 && u->level < h->write_level))))) {
+        mg_http_reply(c, 403, JSON_HEADERS, "Not Authorised\n");
+        c->data[0] = 'Z';  // Mark this connection as handled
+      }
+    }
+#endif
+  }
+
+  // We're checking c->is_websocket cause WS connection use c->data
+  if (c->is_websocket == 0) handle_uploads(c, ev, ev_data);
+  if (ev == MG_EV_POLL && c->is_websocket == 0 && c->data[0] == 'A') {
     // Check if action in progress is complete
     struct action_state *as = (struct action_state *) c->data;
     if (as->fn() == false) {
       mg_http_reply(c, 200, JSON_HEADERS, "true");
       memset(as, 0, sizeof(*as));
     }
-  } else
-#endif
-      if (ev == MG_EV_HTTP_MSG && c->data[0] != 'U') {
+  } else if (ev == MG_EV_HTTP_MSG && c->is_websocket == 0 && c->data[0] == 0) {
     struct mg_http_message *hm = (struct mg_http_message *) ev_data;
-#if WIZARD_ENABLE_HTTP_UI
+#if WIZARD_ENABLE_HTTP || WIZARD_ENABLE_HTTPS
     struct apihandler *h = find_handler(hm);
 #if WIZARD_ENABLE_HTTP_UI_LOGIN
     struct user *u = authenticate(hm);
-    if (mg_match(hm->uri, mg_str("/api/#"), NULL) &&
-        (u == NULL ||
-         (h != NULL && (u->level < h->read_level ||
-                        (hm->body.len > 0 && u->level < h->write_level))))) {
-      // MG_INFO(("DENY: %d, %d %d", u->level, h->read_level, h->write_level));
-      mg_http_reply(c, 403, JSON_HEADERS, "Not Authorised\n");
-    } else if (mg_match(hm->uri, mg_str("/api/login"), NULL)) {
+    if (mg_match(hm->uri, mg_str("/api/login"), NULL)) {
       handle_login(c, u);
     } else if (mg_match(hm->uri, mg_str("/api/logout"), NULL)) {
       handle_logout(c);
@@ -476,25 +591,29 @@ static void http_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
 #endif
         if (mg_match(hm->uri, mg_str("/api/ok"), NULL)) {
       mg_http_reply(c, 200, JSON_HEADERS, "true\n");
+    } else if (mg_match(hm->uri, mg_str("/websocket"), NULL)) {
+      mg_ws_upgrade(c, hm, NULL);
     } else if (mg_match(hm->uri, mg_str("/api/heartbeat"), NULL)) {
       mg_http_reply(c, 200, JSON_HEADERS, "{%m:%lu}\n", MG_ESC("version"),
                     s_device_change_version);
     } else if (h != NULL) {
       handle_api_call(c, hm, h);
-    } else
-#endif  // WIZARD_ENABLE_HTTP_UI
+    } else if (c->data[0] == 0)
+#endif  // WIZARD_ENABLE_HTTP || WIZARD_ENABLE_HTTPS
     {
+#if WIZARD_ENABLE_HTTP_UI
       struct mg_http_serve_opts opts;
       memset(&opts, 0, sizeof(opts));
       opts.root_dir = "/web_root/";
       opts.fs = &mg_fs_packed;
       opts.extra_headers = NO_CACHE_HEADERS;
       mg_http_serve_dir(c, hm, &opts);
+#else
+      mg_http_reply(c, 200, "", ":)\n");
+#endif  // WIZARD_ENABLE_HTTP_UI
     }
-    // Show this request
-    MG_DEBUG(("%lu %.*s %.*s %lu -> %.*s", c->id, hm->method.len,
-              hm->method.buf, hm->uri.len, hm->uri.buf, hm->body.len,
-              c->send.len > 15 ? 3 : 0, &c->send.buf[9]));
+  } else if (ev == MG_EV_WS_MSG || ev == MG_EV_WS_CTL) {
+    // Ignore received data
   } else if (ev == MG_EV_ACCEPT) {
     if (c->fn_data != NULL) {  // TLS listener
       struct mg_tls_opts opts;
@@ -504,7 +623,68 @@ static void http_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
       mg_tls_init(c, &opts);
     }
   }
+
+  if (ev == MG_EV_HTTP_MSG) {
+    // Show this request
+    struct mg_http_message *hm = (struct mg_http_message *) ev_data;
+    MG_DEBUG(("%lu %.*s %.*s %lu -> %.*s %lu", c->id, hm->method.len,
+              hm->method.buf, hm->uri.len, hm->uri.buf, hm->body.len,
+              c->send.len > 15 ? 3 : 0, &c->send.buf[9], c->send.len));
+    if (c->data[0] == 'Z') {
+      c->data[0] = 0;
+      c->is_resp = 0;
+    }
+  }
 }
+
+#if WIZARD_ENABLE_WEBSOCKET
+struct ws_handler {
+  unsigned timeout_ms;
+  void (*fn)(struct mg_connection *);
+};
+static struct ws_handler
+    s_ws_handlers[sizeof(((struct mg_connection *) 0)->data) /
+                  sizeof(struct ws_handler)];
+static size_t s_ws_handlers_count;
+
+void mongoose_add_ws_handler(unsigned ms, void (*fn)(struct mg_connection *)) {
+  size_t max = sizeof(s_ws_handlers) / sizeof(s_ws_handlers[0]);
+  if (s_ws_handlers_count >= max) {
+    MG_ERROR(("WS handlers limit exceeded, max %lu", max));
+  } else {
+    s_ws_handlers[s_ws_handlers_count].timeout_ms = ms;
+    s_ws_handlers[s_ws_handlers_count].fn = fn;
+    s_ws_handlers_count++;
+  }
+};
+
+static void send_websocket_data(void) {
+  struct mg_connection *c;
+  uint64_t now = mg_millis();
+
+  for (c = g_mgr.conns; c != NULL; c = c->next) {
+    uint64_t *timers = (uint64_t *) &c->data[0];
+    size_t i;
+
+    if (c->is_websocket == 0) continue;  // Not a websocket connection? Skip
+    if (c->send.len > 2048) continue;    // Too much data already? Skip
+
+    for (i = 0; i < s_ws_handlers_count; i++) {
+      if (c->pfn_data == NULL ||
+          mg_timer_expired(&timers[i], s_ws_handlers[i].timeout_ms, now)) {
+        s_ws_handlers[i].fn(c);
+        c->pfn_data = (void *) 1;
+      }
+    }
+  }
+}
+#else
+void mongoose_add_ws_handler(unsigned ms, void (*fn)(struct mg_connection *)) {
+  (void) ms, (void) fn;
+  MG_ERROR(("Websocket support is not enabled!"));
+}
+#endif  // WIZARD_ENABLE_WEBSOCKET
+
 #endif  // WIZARD_ENABLE_HTTP || WIZARD_ENABLE_HTTPS
 
 #if WIZARD_ENABLE_SNTP
@@ -533,53 +713,47 @@ static void sntp_timer(void *param) {
 #endif  // WIZARD_ENABLE_SNTP
 
 #if WIZARD_ENABLE_MQTT
+static struct mongoose_mqtt_handlers s_mqtt_handlers = {
+    glue_mqtt_connect, glue_mqtt_tls_init, glue_mqtt_on_connect,
+    glue_mqtt_on_message, glue_mqtt_on_cmd};
+
 struct mg_connection *g_mqtt_conn;  // MQTT client connection
 
 static void mqtt_event_handler(struct mg_connection *c, int ev, void *ev_data) {
   if (ev == MG_EV_CONNECT) {
-    glue_mqtt_tls_init(c);
+    s_mqtt_handlers.tls_init_fn(c);
   } else if (ev == MG_EV_MQTT_OPEN) {
-    glue_mqtt_on_connect(c, *(int *) ev_data);
+    s_mqtt_handlers.on_connect_fn(c, *(int *) ev_data);
   } else if (ev == MG_EV_MQTT_CMD) {
-    glue_mqtt_on_cmd(c, ev_data);
+    s_mqtt_handlers.on_cmd_fn(c, ev_data);
   } else if (ev == MG_EV_MQTT_MSG) {
     struct mg_mqtt_message *mm = (struct mg_mqtt_message *) ev_data;
-    glue_mqtt_on_message(c, mm->topic, mm->data);
-    mqttCallback(c, mm);
+    s_mqtt_handlers.on_message_fn(c, mm->topic, mm->data);
   } else if (ev == MG_EV_CLOSE) {
-    MG_DEBUG(("%lu Closing", c->id));
     g_mqtt_conn = NULL;
   }
 }
 
 static void mqtt_timer(void *arg) {
-  struct mg_mgr *mgr = (struct mg_mgr *) arg;
   if (g_mqtt_conn == NULL) {
-    g_mqtt_conn = glue_mqtt_connect(mgr, mqtt_event_handler);
+    g_mqtt_conn = s_mqtt_handlers.connect_fn(mqtt_event_handler);
   }
+  (void) arg;
 }
 
-// USER WEBSOCKET HANDLE
-static void ws_event_handler(struct mg_connection *c, int ev, void *ev_data) {
-	if (ev == MG_EV_OPEN) {
-	} else if (ev == MG_EV_HTTP_MSG) {
-		struct mg_http_message *hm = (struct mg_http_message*) ev_data;
-		if (mg_match(hm->uri, mg_str("/websocket"), NULL)) {
-			mg_ws_upgrade(c, hm, NULL);
-		} else if (mg_match(hm->uri, mg_str("/rest"), NULL)) {
-			mg_http_reply(c, 200, "", "{\"result\": %d}\n", 123);
-		} else {
-			struct mg_http_serve_opts opts = { .root_dir = s_web_root };
-			mg_http_serve_dir(c, ev_data, &opts);
-		}
-	} else if (ev == MG_EV_WS_MSG) {
-		struct mg_ws_message *wm = (struct mg_ws_message *) ev_data;
-		glue_websocket_on_message(c, wm);
-	}
+void mongoose_set_mqtt_handlers(struct mongoose_mqtt_handlers *h) {
+  if (h->connect_fn) s_mqtt_handlers.connect_fn = h->connect_fn;
+  if (h->tls_init_fn) s_mqtt_handlers.tls_init_fn = h->tls_init_fn;
+  if (h->on_message_fn) s_mqtt_handlers.on_message_fn = h->on_message_fn;
+  if (h->on_connect_fn) s_mqtt_handlers.on_connect_fn = h->on_connect_fn;
+  if (h->on_cmd_fn) s_mqtt_handlers.on_cmd_fn = h->on_cmd_fn;
 }
 #endif  // WIZARD_ENABLE_MQTT
 
 #if WIZARD_ENABLE_MODBUS
+static struct mongoose_modbus_handlers s_modbus_handlers = {
+    glue_modbus_read_reg, glue_modbus_write_reg};
+
 static void handle_modbus_pdu(struct mg_connection *c, uint8_t *buf,
                               size_t len) {
   MG_DEBUG(("Received PDU %p len %lu, hexdump:", buf, len));
@@ -600,7 +774,7 @@ static void handle_modbus_pdu(struct mg_connection *c, uint8_t *buf,
     if (func == 6) {  // write single holding register
       uint16_t start = mg_ntohs(*(uint16_t *) &buf[8]);
       uint16_t value = mg_ntohs(*(uint16_t *) &buf[10]);
-      success = glue_modbus_write_reg(start, value);
+      success = s_modbus_handlers.write_reg_fn(start, value);
       *(uint16_t *) &response[8] = mg_htons(start);
       *(uint16_t *) &response[10] = mg_htons(value);
       response_len = 12;
@@ -611,8 +785,8 @@ static void handle_modbus_pdu(struct mg_connection *c, uint8_t *buf,
       uint16_t i, *data = (uint16_t *) &buf[13];
       if ((size_t) (num * 2 + 10) < sizeof(response)) {
         for (i = 0; i < num; i++) {
-          success =
-              glue_modbus_write_reg((uint16_t) (start + i), mg_htons(data[i]));
+          success = s_modbus_handlers.write_reg_fn((uint16_t) (start + i),
+                                                   mg_htons(data[i]));
           if (success == false) break;
         }
         *(uint16_t *) &response[8] = mg_htons(start);
@@ -626,7 +800,7 @@ static void handle_modbus_pdu(struct mg_connection *c, uint8_t *buf,
       if ((size_t) (num * 2 + 9) < sizeof(response)) {
         uint16_t i, val, *data = (uint16_t *) &response[9];
         for (i = 0; i < num; i++) {
-          success = glue_modbus_read_reg((uint16_t) (start + i), &val);
+          success = s_modbus_handlers.read_reg_fn((uint16_t) (start + i), &val);
           if (success == false) break;
           data[i] = mg_htons(val);
         }
@@ -660,7 +834,108 @@ static void modbus_ev_handler(struct mg_connection *c, int ev, void *ev_data) {
   }
   (void) ev_data;
 }
+
+void mongoose_set_modbus_handlers(struct mongoose_modbus_handlers *h) {
+  if (h->read_reg_fn) s_modbus_handlers.read_reg_fn = h->read_reg_fn;
+  if (h->write_reg_fn) s_modbus_handlers.write_reg_fn = h->write_reg_fn;
+}
 #endif  // WIZARD_ENABLE_MODBUS
+
+#if WIZARD_CAPTIVE_PORTAL
+
+#if MG_ARCH == MG_ARCH_UNIX || MG_ARCH == MG_ARCH_WIN32
+#define CAPTIVE_PORTAL_URL "udp://0.0.0.0:5533"
+#else
+#define CAPTIVE_PORTAL_URL "udp://0.0.0.0:53"
+#endif
+
+static const uint8_t answer[] = {
+    0xc0, 0x0c,          // Point to the name in the DNS question
+    0,    1,             // 2 bytes - record type, A
+    0,    1,             // 2 bytes - address class, INET
+    0,    0,    0, 120,  // 4 bytes - TTL
+    0,    4              // 2 bytes - address length
+};
+
+static void dns_fn(struct mg_connection *c, int ev, void *ev_data) {
+  if (ev == MG_EV_READ) {
+    struct mg_dns_rr rr;  // Parse first question, offset 12 is header size
+    size_t n = mg_dns_parse_rr(c->recv.buf, c->recv.len, 12, true, &rr);
+    MG_DEBUG(("DNS request parsed, result=%d", (int) n));
+    if (n > 0) {
+      char buf[512];
+      uint32_t ip;
+      struct mg_dns_header *h = (struct mg_dns_header *) buf;
+      memset(buf, 0, sizeof(buf));  // Clear the whole datagram
+      h->txnid = ((struct mg_dns_header *) c->recv.buf)->txnid;  // Copy tnxid
+      h->num_questions = mg_htons(1);  // We use only the 1st question
+      h->num_answers = mg_htons(1);    // And only one answer
+      h->flags = mg_htons(0x8400);     // Authoritative response
+      memcpy(buf + sizeof(*h), c->recv.buf + sizeof(*h), n);  // Copy question
+      memcpy(buf + sizeof(*h) + n, answer, sizeof(answer));   // And answer
+#if MG_ENABLE_TCPIP
+      ip = c->mgr->ifp->ip;
+#else
+      ip = MG_TCPIP_IP;
+#endif
+      memcpy(buf + sizeof(*h) + n + sizeof(answer), &ip, 4);
+      mg_send(c, buf, 12 + n + sizeof(answer) + 4);  // And send it!
+    }
+    mg_iobuf_del(&c->recv, 0, c->recv.len);
+  }
+  (void) ev_data;
+}
+#endif  // WIZARD_CAPTIVE_PORTAL
+
+#if WIZARD_ENABLE_MDNS
+
+static const uint8_t mdns_answer[] = {
+    0xc0, 0x0c,          // Point to the name in the DNS question
+    0,    1,             // 2 bytes - record type, A
+    0,    1,             // 2 bytes - address class, INET
+    0,    0,    0, 120,  // 4 bytes - TTL
+    0,    4              // 2 bytes - address length
+};
+
+static void mdns_fn(struct mg_connection *c, int ev, void *ev_data) {
+  if (ev == MG_EV_READ) {
+    struct mg_dns_rr rr;  // Parse first question, offset 12 is header size
+    size_t n = mg_dns_parse_rr(c->recv.buf, c->recv.len, 12, true, &rr);
+    MG_DEBUG(("MDNS request parsed, result=%d", (int) n));
+    if (n > 0) {
+      char buf[512];
+      char local_name[256];
+      uint32_t ip;
+      struct mg_dns_header *h = (struct mg_dns_header *) buf;
+      struct mg_dns_message dm;
+      mg_dns_parse(c->recv.buf, c->recv.len, &dm);
+      memset(buf, 0, sizeof(buf));  // Clear the whole datagram
+      memset(local_name, 0, sizeof(local_name));
+      mg_snprintf(local_name, sizeof(local_name) - 1, "%s.local", WIZARD_MDNS_NAME);
+      if (strcmp(local_name, dm.name)) {
+        mg_iobuf_del(&c->recv, 0, c->recv.len);
+        return; // Names do not match: drop
+      }
+      h->txnid = ((struct mg_dns_header *) c->recv.buf)->txnid;  // Copy tnxid
+      h->num_questions = mg_htons(1);  // We use only the 1st question
+      h->num_answers = mg_htons(1);    // And only one answer
+      h->flags = mg_htons(0x8400);     // Authoritative response
+      memcpy(buf + sizeof(*h), c->recv.buf + sizeof(*h), n);  // Copy question
+      memcpy(buf + sizeof(*h) + n, mdns_answer, sizeof(mdns_answer));   // And answer
+#if MG_ENABLE_TCPIP
+      ip = c->mgr->ifp->ip;
+#else
+      ip = MG_TCPIP_IP;
+#endif
+      memcpy(buf + sizeof(*h) + n + sizeof(mdns_answer), &ip, 4);
+      mg_send(c, buf, 12 + n + sizeof(mdns_answer) + 4);  // And send it!
+    }
+    mg_iobuf_del(&c->recv, 0, c->recv.len);
+  }
+  (void) ev_data;
+}
+
+#endif // WIZARD_ENABLE_MDNS
 
 void mongoose_init(void) {
   mg_mgr_init(&g_mgr);      // Initialise event manager
@@ -686,8 +961,7 @@ void mongoose_init(void) {
 
 #if WIZARD_ENABLE_MQTT
   MG_INFO(("Starting MQTT reconnection timer"));
-  mg_timer_add(&g_mgr, 400, MG_TIMER_REPEAT, mqtt_timer, &g_mgr);
-  mg_http_listen(&g_mgr, ws_listen_on, ws_event_handler, NULL);  // Create HTTP listener
+  mg_timer_add(&g_mgr, 1000, MG_TIMER_REPEAT, mqtt_timer, &g_mgr);
 #endif
 
 #if WIZARD_ENABLE_MODBUS
@@ -699,12 +973,25 @@ void mongoose_init(void) {
   }
 #endif
 
-  MG_INFO(("Mongoose init complete, calling user init"));
-  glue_init();
+#if WIZARD_CAPTIVE_PORTAL
+  MG_INFO(("Starting captive portal"));
+  mg_listen(&g_mgr, CAPTIVE_PORTAL_URL, dns_fn, NULL);
+#endif
+
+#if WIZARD_ENABLE_MDNS
+  MG_INFO(("Starting MDNS (domain name: %s.local)", WIZARD_MDNS_NAME));
+  mg_listen(&g_mgr, "udp://0.0.0.0:5353", mdns_fn, NULL);
+#endif
+
+  glue_lock_init();
+  MG_INFO(("Mongoose init complete"));
 }
 
 void mongoose_poll(void) {
   glue_lock();
   mg_mgr_poll(&g_mgr, 10);
+#if WIZARD_ENABLE_WEBSOCKET
+  send_websocket_data();
+#endif
   glue_unlock();
 }

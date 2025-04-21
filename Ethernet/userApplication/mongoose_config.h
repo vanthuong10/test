@@ -3,8 +3,7 @@
 // See https://mongoose.ws/documentation/#build-options
 #define MG_ARCH MG_ARCH_FREERTOS
 #define MG_TLS MG_TLS_BUILTIN
-#define MG_DEVICE MG_DEVICE_STM32H7
-#define MG_OTA MG_OTA_FLASH
+#define MG_OTA MG_OTA_STM32H7
 
 #define MG_ENABLE_TCPIP 1
 #define MG_ENABLE_CUSTOM_RANDOM 1
@@ -17,9 +16,9 @@
 // For static IP configuration, define MG_TCPIP_{IP,MASK,GW}
 // By default, those are set to zero, meaning that DHCP is used
 //
-// #define MG_TCPIP_IP MG_IPV4(10, 14, 16, 34)     // IP
-// #define MG_TCPIP_GW MG_IPV4(10, 14, 17, 1)      // Gateway
-// #define MG_TCPIP_MASK MG_IPV4(255, 255, 254, 0)  // Netmask
+// #define MG_TCPIP_IP MG_IPV4(192, 168, 0, 10)     // IP
+// #define MG_TCPIP_GW MG_IPV4(192, 168, 0, 1)      // Gateway
+// #define MG_TCPIP_MASK MG_IPV4(255, 255, 255, 0)  // Netmask
 
 // Construct MAC address from the MCU unique ID. It is defined in the
 // ST CMSIS header as UID_BASE

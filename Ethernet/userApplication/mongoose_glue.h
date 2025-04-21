@@ -12,12 +12,14 @@ extern "C" {
 #include "mongoose.h"
 
 #define WIZARD_ENABLE_HTTP 1
-#define WIZARD_ENABLE_HTTPS 1
+#define WIZARD_ENABLE_HTTPS 0
 #define WIZARD_ENABLE_HTTP_UI 1
 #define WIZARD_ENABLE_HTTP_UI_LOGIN 1
 
+#define WIZARD_ENABLE_WEBSOCKET 1
+
 #define WIZARD_ENABLE_MQTT 1
-//#define WIZARD_MQTT_URL "mqtt://10.14.16.29:1991"
+#define WIZARD_MQTT_URL "mqtt://broker.hivemq.com:1883"
 
 #define WIZARD_ENABLE_SNTP 0  // Enable time sync.
 #define WIZARD_SNTP_TYPE 0    // 0: default Google, 1: DHCP, 2: custom
@@ -26,22 +28,39 @@ extern "C" {
 
 #define WIZARD_DNS_TYPE 0  // 0: default Google, 1: DHCP, 2: custom
 #define WIZARD_DNS_URL "udp://8.8.8.8:53"  // Custom DNS server URL
+#define WIZARD_CAPTIVE_PORTAL 0
+#define WIZARD_ENABLE_MDNS 0
+#define WIZARD_MDNS_NAME ""
 
 #define WIZARD_ENABLE_MODBUS 0
 #define WIZARD_MODBUS_PORT 502
 
 #ifndef WIZARD_REBOOT_TIMEOUT_MS
 #define WIZARD_REBOOT_TIMEOUT_MS 500
-
-#define  ws_listen_on  "ws://localhost:8000"
-#define  s_web_root  "."
 #endif
 
 void mongoose_init(void);    // Initialise Mongoose
 void mongoose_poll(void);    // Poll Mongoose
 extern struct mg_mgr g_mgr;  // Mongoose event manager
-void glue_init(void);        // Called at the end of mongoose_init()
-extern char topicBff[3][64];
+
+void mongoose_set_http_handlers(const char *name, ...);
+void mongoose_add_ws_handler(unsigned ms, void (*)(struct mg_connection *));
+
+struct mongoose_mqtt_handlers {
+  struct mg_connection *(*connect_fn)(mg_event_handler_t);
+  void (*tls_init_fn)(struct mg_connection *);
+  void (*on_connect_fn)(struct mg_connection *, int);
+  void (*on_message_fn)(struct mg_connection *, struct mg_str, struct mg_str);
+  void (*on_cmd_fn)(struct mg_connection *, struct mg_mqtt_message *);
+};
+void mongoose_set_mqtt_handlers(struct mongoose_mqtt_handlers *);
+
+struct mongoose_modbus_handlers {
+  bool (*read_reg_fn)(uint16_t address, uint16_t *value);
+  bool (*write_reg_fn)(uint16_t address, uint16_t value);
+};
+void mongoose_set_modbus_handlers(struct mongoose_modbus_handlers *);
+
 #define run_mongoose() \
   do {                 \
     mongoose_init();   \
@@ -51,29 +70,6 @@ extern char topicBff[3][64];
   } while (0)
 
 #if WIZARD_ENABLE_MQTT
-
-typedef enum {
-	SELECT_INFO_TOPIC,
-	SELECT_REPORT_TOPIC,
-	SELECT_COMPLETE_TOPIC,
-}SelectTopic;
-
-struct INTERNET_CONFIG {
-	uint32_t ip, mask, gw;           // IP address, mask, default gateway
-	char *mqttBroker ;				 // MQTT broker
-	char *mqttUser	 ;				 // MQTT User
-	char *mqttPass	 ;				 // MQTT password
-	char *s_sub_handle  ;			 // Subscribe topic handle
-	char *s_sub_run     ;			 // Subscribe topic run
-	char *s_sub_admin   ;			 // Subscribe topic admin
-	char *s_pub_info    ; 			 // publish topic info
-	char *s_pub_report  ;			 // Publish topic report
-	char *s_pub_complete;			 // Publish topic complete mission
-	char *no			;			 // Serial number of Shuttle
-};
-extern uint8_t *tcpConnectState;
-void mqtt_publish(struct mg_str message, SelectTopic selectTopic);
-void ws_transmit_timer(void *arg);
 void glue_lock_init(void);  // Initialise global Mongoose mutex
 void glue_lock(void);       // Lock global Mongoose mutex
 void glue_unlock(void);     // Unlock global Mongoose mutex
@@ -92,29 +88,31 @@ void glue_update_state(void);
 
 extern struct mg_connection *g_mqtt_conn;  // MQTT client connection
 
-void glue_mqtt_tls_init(struct mg_connection *c);
-struct mg_connection *glue_mqtt_connect( struct mg_mgr *, void (*ev_handler)(struct mg_connection *, int, void *));
+void glue_mqtt_tls_init(struct mg_connection *);
+struct mg_connection *glue_mqtt_connect(mg_event_handler_t ev_hanler_fn);
 void glue_mqtt_on_connect(struct mg_connection *c, int code);
 void glue_mqtt_on_message(struct mg_connection *c, struct mg_str topic,
                           struct mg_str data);
 void glue_mqtt_on_cmd(struct mg_connection *c, struct mg_mqtt_message *mm);
-void glue_websocket_on_message(struct mg_connection *c,struct mg_ws_message *wsm);
 
-void websocketCallback(struct mg_connection *con, struct mg_ws_message *wsm ) ;
-void mqttCallback(struct mg_connection *con, struct mg_mqtt_message *mqttm );
-void httpCallback(struct mg_connection *con, struct mg_str httpm );
+
 int    glue_authenticate(const char *user, const char *pass);
 
-bool glue_check_reboot(void);
-void glue_start_reboot(void);
+void glue_start_reboot(struct mg_str);  // Start an action
+bool glue_check_reboot(void);  // Check if action is still in progress
+
+void glue_start_reformat(struct mg_str);  // Start an action
+bool glue_check_reformat(void);  // Check if action is still in progress
+
 void *glue_ota_begin_firmware_update(char *file_name, size_t total_size);
 bool glue_ota_end_firmware_update(void *context);
 bool glue_ota_write_firmware_update(void *context, void *buf, size_t len);
+
 void *glue_file_open_file_upload(char *file_name, size_t total_size);
 bool glue_file_close_file_upload(void *context);
 bool glue_file_write_file_upload(void *context, void *buf, size_t len);
-size_t glue_graph_get_graph1(uint32_t from, uint32_t to,
-                              uint32_t *x_values, double *y_values, size_t len);
+
+void glue_reply_graph_data(struct mg_connection *, struct mg_http_message *);
 struct state {
   int speed;
   int temperature;
@@ -126,7 +124,6 @@ struct state {
   int level;
 };
 void glue_get_state(struct state *);
-void glue_set_state(struct state *);
 
 struct leds {
   bool led1;
@@ -136,9 +133,19 @@ struct leds {
 void glue_get_leds(struct leds *);
 void glue_set_leds(struct leds *);
 
+struct network_settings {
+  int shuttle_id;
+  char ip_address[20];
+  char gw_address[20];
+  char netmask[20];
+  bool dhcp;
+};
+void glue_get_network_settings(struct network_settings *);
+void glue_set_network_settings(struct network_settings *);
+
 struct settings {
   char string_val[40];
-  int log_level;
+  char log_level[10];
   double double_val;
   int int_val;
   bool bool_val;
@@ -152,6 +159,9 @@ struct security {
 };
 void glue_get_security(struct security *);
 void glue_set_security(struct security *);
+
+void glue_reply_loglevels(struct mg_connection *, struct mg_http_message *);
+void glue_reply_events(struct mg_connection *, struct mg_http_message *);
 
 
 #ifdef __cplusplus
